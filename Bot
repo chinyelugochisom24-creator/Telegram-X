@@ -1,0 +1,396 @@
+//+------------------------------------------------------------------+
+//| DIY Custom Strategy EA - Multi-Entry (MT5)                       |
+//| - Supports: basic EMA crossover, indicator-based, structure(BOS)|
+//|   sniper-hybrid, and combined TradingView-style confirmations    |
+//| - Timeframe: configurable (default M5)                            |
+//| - Fixed TP/SL in pips (TP=90 pips, SL=300 pips by user request)  |
+//| - Position sizing by risk % (or fixed lots)                      |
+//| - CSV logging, single-file compact modular design                 |
+//+------------------------------------------------------------------+
+#property copyright "Converted"
+#property version   "1.20"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--------------------- USER INPUTS ------------------------------------
+input ENUM_TIMEFRAMES   UseTF                = PERIOD_M5;    // EA timeframe
+input bool              UseTrailingOnChart   = true;
+
+input int               TP_Pips              = 90;           // Take profit in pips
+input int               SL_Pips              = 300;          // Stop loss in pips (distance)
+input bool              UseFixedSLInPips     = true;         // Use fixed SL in pips (true) or percent (false)
+
+input bool              EnableBasicCross     = true;         // basic EMA cross entry
+input int               CrossFastEMA         = 8;
+input int               CrossSlowEMA         = 21;
+
+input bool              EnableIndicatorEntry = true;         // indicator based (RSI/RangeFilter)
+input bool              IF_UseRSI            = true;
+input int               IF_RSI_Period        = 14;
+input int               IF_RSI_LongLimit     = 40;
+input int               IF_RSI_ShortLimit    = 60;
+input bool              IF_UseRangeFilter    = true;
+input bool              RF_UseATR            = true;
+input int               RF_ATR_Period        = 14;
+input double            RF_Percent           = 0.5;          // percent when not using ATR
+
+input bool              EnableStructureBOS   = true;         // basic BOS/CHOCH (swing break)
+input int               BOS_Lookback         = 50;           // bars to scan for swing
+
+input bool              EnableSniperHybrid   = true;         // require indicator + structure
+input bool              TreatAnyEntryAsOK    = true;         // if true: any enabled method triggers; if false: require unanimous (all enabled) - user chose "All", but default Any for flexibility
+
+// Money management
+input double            RiskPercent          = 1.0;          // percent of balance risked per trade
+input bool              UseFixedLots         = false;
+input double            FixedLots            = 0.01;
+input double            MinLot               = 0.01;
+input int               SlippagePoints       = 10;
+
+// Behavior
+input bool              AllowBuy             = true;
+input bool              AllowSell            = true;
+input bool              OnlyOnePositionDir   = true;
+input bool              WriteCSVLog          = true;
+input string            LogFileName          = "DIY_Strategy_Trades.csv";
+
+//--------------------------------------------------------------------
+// Globals
+datetime last_bar_time = 0;
+
+//--------------------------------------------------------------------
+// Utility: pip size (broker dependent)
+double PipSize()
+{
+   int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+   if(digits >= 5) return(point * 10.0); // 5-digit or 3-decimal JPY style
+   return(point); // 4-digit/2-decimal instruments: point equals pip
+}
+
+//--------------------------------------------------------------------
+// CSV logger (append)
+void CSV_Log(string side, double entry, double sl, double tp, double lots, string comment)
+{
+   if(!WriteCSVLog) return;
+   int fh = FileOpen(LogFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI);
+   if(fh == INVALID_HANDLE)
+   {
+      fh = FileOpen(LogFileName, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      if(fh == INVALID_HANDLE) return;
+      FileWrite(fh, "time,symbol,side,entry,sl,tp,lots,comment");
+      FileClose(fh);
+      fh = FileOpen(LogFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI);
+      if(fh == INVALID_HANDLE) return;
+   }
+   FileSeek(fh, 0, SEEK_END);
+   string timestr = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   FileWrite(fh, timestr, Symbol(), side, DoubleToString(entry, Digits()), DoubleToString(sl, Digits()), DoubleToString(tp, Digits()), DoubleToString(lots,2), comment);
+   FileClose(fh);
+}
+
+//--------------------------------------------------------------------
+// Indicator helpers
+bool EMA_Cross_Long(ENUM_TIMEFRAMES tf, int fast, int slow)
+{
+   double f_now = iMA(Symbol(), (int)tf, fast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double s_now = iMA(Symbol(), (int)tf, slow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double f_prev = iMA(Symbol(), (int)tf, fast, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double s_prev = iMA(Symbol(), (int)tf, slow, 0, MODE_EMA, PRICE_CLOSE, 1);
+   return (f_prev <= s_prev && f_now > s_now);
+}
+bool EMA_Cross_Short(ENUM_TIMEFRAMES tf, int fast, int slow)
+{
+   double f_now = iMA(Symbol(), (int)tf, fast, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double s_now = iMA(Symbol(), (int)tf, slow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double f_prev = iMA(Symbol(), (int)tf, fast, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double s_prev = iMA(Symbol(), (int)tf, slow, 0, MODE_EMA, PRICE_CLOSE, 1);
+   return (f_prev >= s_prev && f_now < s_now);
+}
+
+bool RSI_Confirm_Long(ENUM_TIMEFRAMES tf, int period, int limit)
+{
+   double rsi = iRSI(Symbol(), (int)tf, period, PRICE_CLOSE, 0);
+   return (rsi >= limit);
+}
+bool RSI_Confirm_Short(ENUM_TIMEFRAMES tf, int period, int limit)
+{
+   double rsi = iRSI(Symbol(), (int)tf, period, PRICE_CLOSE, 0);
+   return (rsi <= limit);
+}
+
+// Range filter simple: price > hi_band => long; < lo_band => short
+void RangeFilterBands(ENUM_TIMEFRAMES tf, double &hi, double &lo, double &center)
+{
+   double hh = iHigh(Symbol(), (int)tf, 0);
+   double ll = iLow(Symbol(), (int)tf, 0);
+   center = (hh + ll)/2.0;
+   double unit = RF_UseATR ? iATR(Symbol(), (int)tf, RF_ATR_Period, 0) : iClose(Symbol(), (int)tf, 0) * (RF_Percent/100.0);
+   double prev_center = (iHigh(Symbol(), (int)tf, 1) + iLow(Symbol(), (int)tf, 1))/2.0;
+   double rf = prev_center;
+   if(iHigh(Symbol(), (int)tf, 0) - unit > rf) rf = iHigh(Symbol(), (int)tf, 0) - unit;
+   if(iLow(Symbol(), (int)tf, 0) + unit < rf) rf = iLow(Symbol(), (int)tf, 0) + unit;
+   hi = rf + unit;
+   lo = rf - unit;
+}
+
+//--------------------------------------------------------------------
+// Structure: simple swing high/low detection and breakout (BOS)
+// returns true if breakout above last swing high (long) or below last swing low (short)
+bool BOS_Long_Break(ENUM_TIMEFRAMES tf, int lookback)
+{
+   // find last swing high (local max): price higher than N neighbors
+   int idx = -1;
+   for(int i=1;i<lookback;i++)
+   {
+      double h = iHigh(Symbol(), (int)tf, i);
+      bool isHigh = true;
+      for(int j=1;j<=3;j++) { if(iHigh(Symbol(), (int)tf, i+j) >= h) isHigh = false; if(iHigh(Symbol(), (int)tf, i-j) > h) isHigh = false; }
+      if(isHigh) { idx = i; break; }
+   }
+   if(idx == -1) return false;
+   double swingHigh = iHigh(Symbol(), (int)tf, idx);
+   double closeNow = iClose(Symbol(), (int)tf, 0);
+   return (closeNow > swingHigh);
+}
+bool BOS_Short_Break(ENUM_TIMEFRAMES tf, int lookback)
+{
+   int idx = -1;
+   for(int i=1;i<lookback;i++)
+   {
+      double l = iLow(Symbol(), (int)tf, i);
+      bool isLow = true;
+      for(int j=1;j<=3;j++) { if(iLow(Symbol(), (int)tf, i+j) <= l) isLow = false; if(iLow(Symbol(), (int)tf, i-j) < l) isLow = false; }
+      if(isLow) { idx = i; break; }
+   }
+   if(idx == -1) return false;
+   double swingLow = iLow(Symbol(), (int)tf, idx);
+   double closeNow = iClose(Symbol(), (int)tf, 0);
+   return (closeNow < swingLow);
+}
+
+//--------------------------------------------------------------------
+// Composite checks (Indicator-based)
+bool Indicator_Long_Signal()
+{
+   ENUM_TIMEFRAMES tf = UseTF;
+   bool ok = true;
+   if(IF_UseRSI) ok = ok && RSI_Confirm_Long(tf, IF_RSI_Period, IF_RSI_LongLimit);
+   if(IF_UseRangeFilter)
+   {
+      double hi,lo,cen;
+      RangeFilterBands(tf, hi, lo, cen);
+      ok = ok && (iClose(Symbol(), (int)tf, 0) > hi);
+   }
+   return ok;
+}
+bool Indicator_Short_Signal()
+{
+   ENUM_TIMEFRAMES tf = UseTF;
+   bool ok = true;
+   if(IF_UseRSI) ok = ok && RSI_Confirm_Short(tf, IF_RSI_Period, IF_RSI_ShortLimit);
+   if(IF_UseRangeFilter)
+   {
+      double hi,lo,cen;
+      RangeFilterBands(tf, hi, lo, cen);
+      ok = ok && (iClose(Symbol(), (int)tf, 0) < lo);
+   }
+   return ok;
+}
+
+//--------------------------------------------------------------------
+// Position / lot sizing using SL distance in price (from SL_Pips)
+double CalculateLotByRisk_SLpips(double entry, int sl_pips)
+{
+   if(UseFixedLots) return(MathMax(FixedLots, MinLot));
+   double pip = PipSize();
+   double sl_distance = sl_pips * pip;
+   if(sl_distance <= SymbolInfoDouble(Symbol(), SYMBOL_POINT)*2.0) return 0.0;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_money = balance * (RiskPercent / 100.0);
+   double tick_value = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
+   double tick_size  = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+   if(tick_value > 0 && tick_size > 0)
+   {
+      double ticks = sl_distance / tick_size;
+      double lot = risk_money / (ticks * tick_value);
+      double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+      if(step <= 0) step = 0.01;
+      lot = MathFloor(lot / step) * step;
+      if(lot < step) return 0.0;
+      return lot;
+   }
+   // fallback
+   double contract = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_CONTRACT_SIZE);
+   if(contract <= 0) contract = 1.0;
+   double lot = risk_money / (sl_distance * contract);
+   double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+   lot = MathFloor(lot / step) * step;
+   if(lot < step) return 0.0;
+   return lot;
+}
+
+//--------------------------------------------------------------------
+// Position existence
+bool HasPositionDir(bool buy)
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      if(PositionGetTicket(i) == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != Symbol()) continue;
+      int t = (int)PositionGetInteger(POSITION_TYPE);
+      if(buy && t == POSITION_TYPE_BUY) return true;
+      if(!buy && t == POSITION_TYPE_SELL) return true;
+   }
+   return false;
+}
+
+//--------------------------------------------------------------------
+// Place market order with SL/TP (pips converted)
+bool PlaceOrderMarket(bool isBuy, double lots, int tp_pips, int sl_pips, string comment="")
+{
+   MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+   double pip = PipSize();
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = Symbol();
+   req.volume = lots;
+   req.deviation = SlippagePoints;
+   req.type_filling = ORDER_FILLING_FOK;
+   req.type_time = ORDER_TIME_GTC;
+   if(isBuy) { req.type = ORDER_TYPE_BUY; req.price = SymbolInfoDouble(Symbol(), SYMBOL_ASK); req.sl = req.price - sl_pips * pip; req.tp = req.price + tp_pips * pip; }
+   else     { req.type = ORDER_TYPE_SELL; req.price = SymbolInfoDouble(Symbol(), SYMBOL_BID); req.sl = req.price + sl_pips * pip; req.tp = req.price - tp_pips * pip; }
+   req.comment = comment;
+   if(!OrderSend(req, res))
+   {
+      PrintFormat("OrderSend failed retcode=%d comment=%s", res.retcode, res.comment);
+      return false;
+   }
+   PrintFormat("OrderSend ok ticket=%I64d ret=%d", res.order, res.retcode);
+   CSV_Log(isBuy?"BUY":"SELL", req.price, req.sl, req.tp, lots, comment);
+   return (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_DONE_REMAINDER);
+}
+
+//--------------------------------------------------------------------
+// OnInit / OnDeinit
+int OnInit()
+{
+   last_bar_time = iTime(Symbol(), (int)UseTF, 0);
+   Print("DIY Multi-Entry EA init. TF:", EnumToString(UseTF), " TP:", TP_Pips, " SL:", SL_Pips);
+   return INIT_SUCCEEDED;
+}
+void OnDeinit(const int reason) {}
+
+//--------------------------------------------------------------------
+// OnTick main
+void OnTick()
+{
+   datetime bt = iTime(Symbol(), (int)UseTF, 0);
+   if(bt == last_bar_time) return; // wait for new bar
+   last_bar_time = bt;
+
+   // Evaluate signals
+   bool basic_long = false, basic_short = false;
+   bool ind_long = false, ind_short = false;
+   bool bos_long = false, bos_short = false;
+
+   // Basic EMA cross
+   if(EnableBasicCross)
+   {
+      basic_long = EMA_Cross_Long(UseTF, CrossFastEMA, CrossSlowEMA);
+      basic_short = EMA_Cross_Short(UseTF, CrossFastEMA, CrossSlowEMA);
+   }
+
+   // Indicator-based
+   if(EnableIndicatorEntry)
+   {
+      ind_long = Indicator_Long_Signal();
+      ind_short = Indicator_Short_Signal();
+   }
+
+   // Structure BOS
+   if(EnableStructureBOS)
+   {
+      bos_long = BOS_Long_Break(UseTF, BOS_Lookback);
+      bos_short = BOS_Short_Break(UseTF, BOS_Lookback);
+   }
+
+   // Sniper hybrid: require both indicator and structure
+   bool sniper_long = false, sniper_short = false;
+   if(EnableSniperHybrid)
+   {
+      sniper_long = (ind_long && bos_long) || (basic_long && bos_long) || (ind_long && basic_long);
+      sniper_short = (ind_short && bos_short) || (basic_short && bos_short) || (ind_short && basic_short);
+   }
+
+   // Decide final trigger depending on TreatAnyEntryAsOK (Any vs All)
+   bool final_long = false, final_short = false;
+   // gather signals for any
+   bool any_long = basic_long || ind_long || bos_long || sniper_long;
+   bool any_short = basic_short || ind_short || bos_short || sniper_short;
+   if(TreatAnyEntryAsOK)
+   {
+      final_long = any_long;
+      final_short = any_short;
+   }
+   else
+   {
+      // require all enabled methods to agree (enabled ones only)
+      bool all_long = true, all_short = true;
+      if(EnableBasicCross) all_long = all_long && basic_long, all_short = all_short && basic_short;
+      if(EnableIndicatorEntry) all_long = all_long && ind_long, all_short = all_short && ind_short;
+      if(EnableStructureBOS) all_long = all_long && bos_long, all_short = all_short && bos_short;
+      if(EnableSniperHybrid) all_long = all_long && sniper_long, all_short = all_short && sniper_short;
+      final_long = all_long;
+      final_short = all_short;
+   }
+
+   // Prevent conflicts
+   if(final_long && final_short) { Print("Both long & short signalled; skipping this bar."); return; }
+
+   // Execute long
+   if(final_long && AllowBuy)
+   {
+      if(OnlyOnePositionDir && HasPositionDir(true)) { Print("Buy exists -> skip."); }
+      else
+      {
+         double entry = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+         int tp = TP_Pips;
+         int sl = SL_Pips;
+         double lots = CalculateLotByRisk_SLpips(entry, sl);
+         if(lots <= 0) lots = UseFixedLots ? FixedLots : MinLot;
+         if(lots <= 0) { Print("Lot calc failed -> skip long."); }
+         else
+         {
+            PrintFormat("Signal LONG. lots=%.2f entry=%.5f TP=%dp SL=%dp", lots, entry, tp, sl);
+            PlaceOrderMarket(true, lots, tp, sl, "LONG_MULTI");
+         }
+      }
+   }
+
+   // Execute short
+   if(final_short && AllowSell)
+   {
+      if(OnlyOnePositionDir && HasPositionDir(false)) { Print("Sell exists -> skip."); }
+      else
+      {
+         double entry = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+         int tp = TP_Pips;
+         int sl = SL_Pips;
+         double lots = CalculateLotByRisk_SLpips(entry, sl);
+         if(lots <= 0) lots = UseFixedLots ? FixedLots : MinLot;
+         if(lots <= 0) { Print("Lot calc failed -> skip short."); }
+         else
+         {
+            PrintFormat("Signal SHORT. lots=%.2f entry=%.5f TP=%dp SL=%dp", lots, entry, tp, sl);
+            PlaceOrderMarket(false, lots, tp, sl, "SHORT_MULTI");
+         }
+      }
+   }
+}
+
+//--------------------------------------------------------------------
+// End of EA
+//--------------------------------------------------------------------------
